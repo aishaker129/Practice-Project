@@ -1,12 +1,13 @@
 package com.campusKart.controller;
 
-import com.campusKart.auth.entity.User;
-import com.campusKart.auth.services.ProfileService;
 import com.campusKart.entity.Enum.OrderStatus;
+import com.campusKart.entity.Enum.PaymentMethod;
 import com.campusKart.entity.Orders;
 import com.campusKart.entity.record.OrderResponseDTO;
+import com.campusKart.mapper.OrderMapper;
 import com.campusKart.services.OrderService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -19,24 +20,49 @@ import java.util.List;
 public class OrderController {
 
     private final OrderService orderService;
-    private final ProfileService profileService;
+    private final OrderMapper orderMapper;
 
+    /**
+     * Place an order from the user's cart
+     */
     @PostMapping("/place")
-    public ResponseEntity<OrderResponseDTO> placeOrder(Principal principal) {
-        User buyer = profileService.getCurrentUser(principal);
-        return ResponseEntity.ok(orderService.placeOrder(buyer));
+    public ResponseEntity<OrderResponseDTO> placeOrder(
+            @RequestParam PaymentMethod paymentMethod,
+            Principal principal) {
+
+        Orders savedOrder = orderService.placeOrder(principal, paymentMethod);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(orderMapper.toDTO(savedOrder));  // use instance method
     }
 
-    @GetMapping
-    public ResponseEntity<List<OrderResponseDTO>> getOrders(Principal principal) {
-        User buyer = profileService.getCurrentUser(principal);
-        return ResponseEntity.ok(orderService.getOrders(buyer));
+    /**
+     * Update order status (seller/admin)
+     */
+    @PatchMapping("/{orderId}/status")
+    public ResponseEntity<OrderResponseDTO> updateOrderStatus(
+            @PathVariable Long orderId,
+            @RequestParam OrderStatus status) {
+
+        Orders updatedOrder = orderService.updateOrderStatus(orderId, status);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(orderMapper.toDTO(updatedOrder));
     }
 
-    @PutMapping("/{orderId}/status")
-    public ResponseEntity<?> updateOrderStatus(@PathVariable Long orderId,
-                                               @RequestParam OrderStatus status) {
-        orderService.updateOrderStatus(orderId, status);
-        return ResponseEntity.ok("Order status updated");
+    /**
+     * Get orders of the current logged-in user
+     */
+    @GetMapping("/my")
+    public ResponseEntity<List<OrderResponseDTO>> getMyOrders(Principal principal) {
+        List<OrderResponseDTO> orders = (List<OrderResponseDTO>) orderService.getMyOrders(principal);
+        return ResponseEntity.ok(orders);
+    }
+
+    /**
+     * Seller view: get orders for products they posted
+     */
+    @GetMapping("/seller/{sellerId}")
+    public ResponseEntity<List<OrderResponseDTO>> getOrdersForSeller(@PathVariable Long sellerId) {
+        List<OrderResponseDTO> orders = (List<OrderResponseDTO>) orderService.getOrdersForSeller(sellerId);
+        return ResponseEntity.ok(orders);
     }
 }

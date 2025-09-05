@@ -26,6 +26,6 @@ public class OrderItem {
     private Product product;
 
     private int quantity;
-    private double priceAtOrderTime;
+    private double totalPrice;
     private String variant;
 }

@@ -1,81 +1,143 @@
 package com.campusKart.services;
 
 import com.campusKart.auth.entity.User;
+import com.campusKart.auth.repository.UserRepo;
+import com.campusKart.dto.ProductResponseDto;
 import com.campusKart.entity.*;
 import com.campusKart.entity.Enum.OrderStatus;
-import com.campusKart.entity.record.BuyerDTO;
-import com.campusKart.entity.record.OrderItemDTO;
-import com.campusKart.entity.record.OrderResponseDTO;
-import com.campusKart.entity.record.SimpleUserDTO;
+import com.campusKart.entity.Enum.PaymentMethod;
 import com.campusKart.mapper.OrderMapper;
-import com.campusKart.repository.CartRepo;
-import com.campusKart.repository.OrderItemRepo;
-import com.campusKart.repository.OrderRepo;
-import com.campusKart.repository.ProductRepository;
+import com.campusKart.repository.*;
+
 import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 
+import java.security.Principal;
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.stream.Collectors;
+
 @Service
 @RequiredArgsConstructor
 public class OrderService {
-    private final OrderRepo orderRepository;
+
+    private final OrderRepo orderRepo;
+    private final OrderItemRepo orderItemRepo;
     private final CartRepo cartRepo;
+    private final CartItemRepo cartItemRepo;
     private final ProductRepository productRepository;
+    private final UserRepo userRepo;
+    private final OrderMapper orderMapper;
 
+    /**
+     * Place an order from the user's cart
+     */
     @Transactional
-    public OrderResponseDTO placeOrder(User buyer) {
+    public Orders placeOrder(Principal principal, PaymentMethod paymentMethod) {
+        User buyer = userRepo.findByEmail(principal.getName())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
+
         Cart cart = cartRepo.findByBuyer(buyer)
-                .orElseThrow(() -> new RuntimeException("Cart not found"));
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Cart not found"));
 
-        if (cart.getItems().isEmpty())
-            throw new RuntimeException("Cart is empty");
+        if (cart.getCartItems().isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Cart is empty");
+        }
 
+        // Create new Order
         Orders order = new Orders();
         order.setBuyer(buyer);
         order.setStatus(OrderStatus.PENDING);
+        order.setPaymentMethod(paymentMethod);
+        order.setCreatedAt(LocalDateTime.now());
 
-        List<OrderItem> orderItems = cart.getItems().stream().map(ci -> {
-            Product product = ci.getProduct();
-            if (product.getStock() < ci.getQuantity()) {
-                throw new RuntimeException("Not enough stock for product: " + product.getTitle());
+        Orders savedOrder = orderRepo.save(order);
+
+        double totalAmount = 0;
+
+        for (CartItem cartItem : cart.getCartItems()) {
+            Product product = cartItem.getProduct();
+
+            // Check stock availability
+            if (product.getStock() < cartItem.getQuantity()) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Insufficient stock for product: " + product.getTitle());
             }
 
-            product.setStock(product.getStock() - ci.getQuantity());
+            // Deduct stock
+            product.setStock(product.getStock() - cartItem.getQuantity());
             productRepository.save(product);
 
-            return new OrderItem(null, order, product,
-                    ci.getQuantity(), ci.getPriceAtAddedTime(), ci.getVariant());
-        }).toList();
+            // Create OrderItem
+            OrderItem orderItem = new OrderItem();
+            orderItem.setOrder(savedOrder);
+            orderItem.setProduct(product);
+            orderItem.setQuantity(cartItem.getQuantity());
+            orderItem.setTotalPrice(product.getPrice() * cartItem.getQuantity());
 
-        order.setItems(orderItems);
+            totalAmount += orderItem.getTotalPrice();
+            orderItemRepo.save(orderItem);
+        }
 
-        // Save order and calculate total amount dynamically in DTO
-        Orders savedOrder = orderRepository.save(order);
+        savedOrder.setTotalAmount(totalAmount);
+        savedOrder = orderRepo.save(savedOrder);
 
-        // Clear cart
-        cart.getItems().clear();
-        cartRepo.save(cart);
+        // Clear cart after placing order
+        cartItemRepo.deleteAll(cart.getCartItems());
 
-        return OrderMapper.toDTO(savedOrder);
+        return savedOrder;
     }
 
-    public List<OrderResponseDTO> getOrders(User buyer) {
-        List<Orders> orders = orderRepository.findByBuyer(buyer);
-        return orders.stream()
-                .map(OrderMapper::toDTO)
-                .toList();
-    }
-
+    /**
+     * Update order status through lifecycle
+     */
     @Transactional
-    public OrderResponseDTO updateOrderStatus(Long orderId, OrderStatus status) {
-        Orders order = orderRepository.findById(orderId)
-                .orElseThrow(() -> new RuntimeException("Order not found"));
+    public Orders updateOrderStatus(Long orderId, OrderStatus newStatus) {
+        Orders order = orderRepo.findById(orderId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found"));
 
-        order.setStatus(status);
-        Orders updatedOrder = orderRepository.save(order);
+        OrderStatus currentStatus = order.getStatus();
 
-        return OrderMapper.toDTO(updatedOrder);
+        // Validate transitions
+        if (!isValidTransition(currentStatus, newStatus)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Invalid status transition: " + currentStatus + " → " + newStatus);
+        }
+
+        order.setStatus(newStatus);
+        order.setUpdatedAt(LocalDateTime.now());
+        return orderRepo.save(order);
+    }
+
+    private boolean isValidTransition(OrderStatus current, OrderStatus next) {
+        return switch (current) {
+            case PENDING -> next == OrderStatus.ACCEPTED;
+            case ACCEPTED -> next == OrderStatus.SHIPPED;
+            case SHIPPED -> next == OrderStatus.DELIVERED;
+            case DELIVERED -> next == OrderStatus.COMPLETED;
+            default -> false;
+        };
+    }
+
+    /**
+     * Get orders of current user
+     */
+    public List<?> getMyOrders(Principal principal) {
+        User user = userRepo.findByEmail(principal.getName())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "User not found"));
+
+        List<Orders> orders = orderRepo.findByBuyerId(user.getId());
+        return orders.stream().map(orderMapper::toDTO).collect(Collectors.toList());
+    }
+
+    /**
+     * Seller view: get all orders for their products
+     */
+    public List<?> getOrdersForSeller(Long sellerId) {
+        List<Orders> orders = orderRepo.findOrdersBySellerId(sellerId);
+        return orders.stream().map(orderMapper::toDTO).collect(Collectors.toList());
     }
 }
